@@ -9,7 +9,7 @@ I am not `responsible` for the possibility of an account being `banned`!
 ## 📎 Stork Node cli version Script features
 
 - Auto validate
-- Auto ping
+- Auto ref
 - multiple accounts, theads
 
 ## ✎ᝰ. RUNNING

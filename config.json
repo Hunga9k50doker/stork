@@ -5,9 +5,14 @@
     "userPoolId": "ap-northeast-1_M22I44OpC"
   },
   "stork": {
-    "intervalSeconds": 60
+    "intervalSeconds": 30,
+    "requestTimeoutMs": 30000,
+    "maxRetries": 5
   },
   "threads": {
-    "maxWorkers": 100
+    "maxWorkers": 5,
+    "maxConcurrentAccounts": 10,
+    "accountBatchSize": 5,
+    "accountBatchDelayMs": 30000
   }
 }
