@@ -1,967 +1,442 @@
-import AmazonCognitoIdentity from "amazon-cognito-identity-js";
-import axios from "axios";
-import fs from "fs";
-import { HttpsProxyAgent } from "https-proxy-agent";
-import path from "path";
-import { fileURLToPath } from "url";
-import { Worker, isMainThread, parentPort, workerData } from "worker_threads";
-import { accounts } from "./accounts.js";
-import chalk from "chalk";
+const fs = require("fs");
+const fsPromises = require("fs/promises");
+const path = require("path");
+const axios = require("axios");
+const colors = require("colors");
+const { HttpsProxyAgent } = require("https-proxy-agent");
+const user_agents = require("./config/userAgents.js");
+const settings = require("./config/config.js");
+const { sleep, loadData, getRandomNumber, isTokenExpired, saveJson } = require("./utils/utils.js");
+const { checkBaseUrl } = require("./utils/checkAPI.js");
+let intervalIds = [];
+const localStorage = require("./localStorage.json");
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+class ClientAPI {
+  constructor(itemData, accountIndex, proxy, baseURL) {
+    this.headers = {
+      Accept: "*/*",
+      "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Sec-Fetch-Dest": "empty",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Site": "none",
+      Origin: "chrome-extension://knnliglhgkmlblppdejchidfihjnockl",
+      connection: "keep-alive",
+      "content-type": "application/json",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    };
+    this.baseURL = baseURL;
+    this.baseURL_v2 = settings.BASE_URL_v2;
 
-function randomDelay(min, max) {
-  const delay = Math.floor(Math.random() * (max - min + 1)) + min;
-  return new Promise((resolve) => setTimeout(resolve, delay));
-}
+    this.itemData = itemData;
+    this.accountIndex = accountIndex;
+    this.proxy = proxy;
+    this.proxyIP = null;
+    this.session_name = null;
+    this.session_user_agents = this.#load_session_data();
+    this.token = null;
+    this.authInfo = null;
+    this.localStorage = localStorage;
+    // this.wallet = getWalletFromPrivateKey(itemData.privateKey);
+  }
 
-async function retryWithExponentialBackoff(fn, maxRetries = 5, initialDelay = 1000) {
-  let retries = 0;
-  while (true) {
+  #load_session_data() {
     try {
-      return await fn();
+      const filePath = path.join(process.cwd(), "session_user_agents.json");
+      const data = fs.readFileSync(filePath, "utf8");
+      return JSON.parse(data);
     } catch (error) {
-      retries++;
-      if (retries > maxRetries || (!error.message.includes("Too many requests") && !error.message.includes("timeout") && !error.message.includes("network") && !error.message.includes("429"))) {
+      if (error.code === "ENOENT") {
+        return {};
+      } else {
         throw error;
       }
-
-      const delay = initialDelay * Math.pow(2, retries) * (0.5 + Math.random());
-      log(`Retrying after ${Math.round(delay / 1000)}s due to: ${error.message}`, "RETRY");
-      await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
-}
 
-class RateLimiter {
-  constructor(maxConcurrent = 5, intervalMs = 1000) {
-    this.queue = [];
-    this.running = 0;
-    this.maxConcurrent = maxConcurrent;
-    this.intervalMs = intervalMs;
-    this.lastRequestTime = 0;
+  #get_random_user_agent() {
+    const randomIndex = Math.floor(Math.random() * user_agents.length);
+    return user_agents[randomIndex];
   }
 
-  async schedule(fn) {
-    return new Promise((resolve, reject) => {
-      this.queue.push({ fn, resolve, reject });
-      this.processQueue();
-    });
+  #get_user_agent() {
+    if (this.session_user_agents[this.session_name]) {
+      return this.session_user_agents[this.session_name];
+    }
+
+    console.log(`[Tài khoản ${this.accountIndex + 1}] Tạo user agent...`.blue);
+    const newUserAgent = this.#get_random_user_agent();
+    this.session_user_agents[this.session_name] = newUserAgent;
+    this.#save_session_data(this.session_user_agents);
+    return newUserAgent;
   }
 
-  async processQueue() {
-    if (this.running >= this.maxConcurrent || this.queue.length === 0) return;
+  #save_session_data(session_user_agents) {
+    const filePath = path.join(process.cwd(), "session_user_agents.json");
+    fs.writeFileSync(filePath, JSON.stringify(session_user_agents, null, 2));
+  }
 
-    const now = Date.now();
-    const timeSinceLastRequest = now - this.lastRequestTime;
+  #get_platform(userAgent) {
+    const platformPatterns = [
+      { pattern: /iPhone/i, platform: "ios" },
+      { pattern: /Android/i, platform: "android" },
+      { pattern: /iPad/i, platform: "ios" },
+    ];
 
-    if (timeSinceLastRequest < this.intervalMs) {
-      setTimeout(() => this.processQueue(), this.intervalMs - timeSinceLastRequest);
+    for (const { pattern, platform } of platformPatterns) {
+      if (pattern.test(userAgent)) {
+        return platform;
+      }
+    }
+
+    return "Unknown";
+  }
+
+  #set_headers() {
+    const platform = this.#get_platform(this.#get_user_agent());
+    this.headers["sec-ch-ua"] = `Not)A;Brand";v="99", "${platform} WebView";v="127", "Chromium";v="127`;
+    this.headers["sec-ch-ua-platform"] = platform;
+    this.headers["User-Agent"] = this.#get_user_agent();
+  }
+
+  createUserAgent() {
+    try {
+      this.session_name = this.itemData.email;
+      this.#get_user_agent();
+    } catch (error) {
+      this.log(`Can't create user agent: ${error.message}`, "error");
       return;
     }
+  }
 
-    this.running++;
-    const { fn, resolve, reject } = this.queue.shift();
-    this.lastRequestTime = Date.now();
+  async log(msg, type = "info") {
+    const accountPrefix = `[Stork][Account ${this.accountIndex + 1}][${this.itemData.email}]`;
+    let ipPrefix = "[Local IP]";
+    if (settings.USE_PROXY) {
+      ipPrefix = this.proxyIP ? `[${this.proxyIP}]` : "[Unknown IP]";
+    }
+    let logMessage = "";
 
+    switch (type) {
+      case "success":
+        logMessage = `${accountPrefix}${ipPrefix} ${msg}`.green;
+        break;
+      case "error":
+        logMessage = `${accountPrefix}${ipPrefix} ${msg}`.red;
+        break;
+      case "warning":
+        logMessage = `${accountPrefix}${ipPrefix} ${msg}`.yellow;
+        break;
+      case "custom":
+        logMessage = `${accountPrefix}${ipPrefix} ${msg}`.magenta;
+        break;
+      default:
+        logMessage = `${accountPrefix}${ipPrefix} ${msg}`.blue;
+    }
+    console.log(logMessage);
+  }
+
+  async checkProxyIP() {
     try {
-      const result = await fn();
-      resolve(result);
-    } catch (error) {
-      reject(error);
-    } finally {
-      this.running--;
-      setTimeout(() => this.processQueue(), this.intervalMs);
-    }
-  }
-}
-
-const authRateLimiter = new RateLimiter(3, 2000);
-const apiRateLimiter = new RateLimiter(10, 1000);
-
-function loadConfig() {
-  try {
-    const configPath = path.join(__dirname, "config.json");
-
-    if (!fs.existsSync(configPath)) {
-      log(`Config file not found at ${configPath}, using default configuration`, "WARN");
-
-      const defaultConfig = {
-        cognito: {
-          region: "ap-northeast-1",
-          clientId: "5msns4n49hmg3dftp2tp1t2iuh",
-          userPoolId: "ap-northeast-1_M22I44OpC",
-        },
-        stork: {
-          intervalSeconds: 30,
-          requestTimeoutMs: 30000,
-          maxRetries: 5,
-        },
-        threads: {
-          maxWorkers: 5,
-          maxConcurrentAccounts: 10,
-          accountBatchSize: 5,
-          accountBatchDelayMs: 30000,
-        },
-      };
-      fs.writeFileSync(configPath, JSON.stringify(defaultConfig, null, 2), "utf8");
-      return defaultConfig;
-    }
-
-    const userConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
-    return userConfig;
-  } catch (error) {
-    log(`Error loading config: ${error.message}`, "ERROR");
-    throw new Error("Failed to load configuration");
-  }
-}
-
-const userConfig = loadConfig();
-const config = {
-  cognito: {
-    region: userConfig.cognito?.region || "ap-northeast-1",
-    clientId: userConfig.cognito?.clientId || "5msns4n49hmg3dftp2tp1t2iuh",
-    userPoolId: userConfig.cognito?.userPoolId || "ap-northeast-1_M22I44OpC",
-    username: userConfig.cognito?.username || "",
-    password: userConfig.cognito?.password || "",
-  },
-  stork: {
-    baseURL: "https://app-api.jp.stork-oracle.network/v1",
-    authURL: "https://api.jp.stork-oracle.network/auth",
-    tokenPath: path.join(__dirname, "tokens"),
-    intervalSeconds: userConfig.stork?.intervalSeconds || 30,
-    requestTimeoutMs: userConfig.stork?.requestTimeoutMs || 30000,
-    maxRetries: userConfig.stork?.maxRetries || 5,
-    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-    origin: "chrome-extension://knnliglhgkmlblppdejchidfihjnockl",
-  },
-  threads: {
-    maxWorkers: userConfig.threads?.maxWorkers || 5,
-    maxConcurrentAccounts: userConfig.threads?.maxConcurrentAccounts || 10,
-    accountBatchSize: userConfig.threads?.accountBatchSize || 5,
-    accountBatchDelayMs: userConfig.threads?.accountBatchDelayMs || 30000,
-    proxyFile: path.join(__dirname, "proxies.txt"),
-  },
-};
-
-if (!fs.existsSync(config.stork.tokenPath)) {
-  fs.mkdirSync(config.stork.tokenPath, { recursive: true });
-}
-
-function validateConfig() {
-  if (accounts.length === 0) {
-    log("ERROR: No accounts found in accounts.js", "ERROR");
-    return false;
-  }
-
-  for (let i = 0; i < accounts.length; i++) {
-    if (!accounts[i].username || !accounts[i].password) {
-      log(`ERROR: Username and password must be set for account at index ${i}`, "ERROR");
-      return false;
-    }
-  }
-  return true;
-}
-
-const poolData = { UserPoolId: config.cognito.userPoolId, ClientId: config.cognito.clientId };
-const userPool = new AmazonCognitoIdentity.CognitoUserPool(poolData);
-
-function getTimestamp() {
-  const now = new Date();
-  return now.toISOString().replace("T", " ").substr(0, 19);
-}
-
-function getFormattedDate() {
-  const now = new Date();
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(
-    2,
-    "0"
-  )}:${String(now.getSeconds()).padStart(2, "0")}`;
-}
-
-function log(message, type = "INFO") {
-  let prefix = `[${getFormattedDate()}] [${type}]`;
-  let newMess = "";
-  switch (type) {
-    case "WARN":
-      newMess = chalk.yellow(`${prefix} ${message}`);
-      break;
-    case "ERROR":
-      newMess = chalk.red(`${prefix} ${message}`);
-      break;
-    case "SUCCESS":
-      newMess = chalk.green(`${prefix} ${message}`);
-      break;
-    case "CUSTOM":
-      newMess = chalk.magenta(`${prefix} ${message}`);
-      break;
-    default:
-      newMess = chalk.blue(`${prefix} ${message}`);
-      break;
-  }
-  return console.log(newMess);
-}
-
-class CognitoAuth {
-  constructor(username, password) {
-    this.username = username;
-    this.password = password;
-    this.authenticationDetails = new AmazonCognitoIdentity.AuthenticationDetails({ Username: username, Password: password });
-    this.cognitoUser = new AmazonCognitoIdentity.CognitoUser({ Username: username, Pool: userPool });
-  }
-
-  async authenticate() {
-    return authRateLimiter.schedule(() => {
-      return new Promise((resolve, reject) => {
-        this.cognitoUser.authenticateUser(this.authenticationDetails, {
-          onSuccess: (result) =>
-            resolve({
-              accessToken: result.getAccessToken().getJwtToken(),
-              idToken: result.getIdToken().getJwtToken(),
-              refreshToken: result.getRefreshToken().getToken(),
-              expiresIn: result.getAccessToken().getExpiration() * 1000 - Date.now(),
-            }),
-          onFailure: (err) => reject(err),
-          newPasswordRequired: () => reject(new Error("New password required")),
-        });
-      });
-    });
-  }
-
-  async refreshSession(refreshToken) {
-    return authRateLimiter.schedule(() => {
-      const refreshTokenObj = new AmazonCognitoIdentity.CognitoRefreshToken({ RefreshToken: refreshToken });
-      return new Promise((resolve, reject) => {
-        this.cognitoUser.refreshSession(refreshTokenObj, (err, result) => {
-          if (err) reject(err);
-          else
-            resolve({
-              accessToken: result.getAccessToken().getJwtToken(),
-              idToken: result.getIdToken().getJwtToken(),
-              refreshToken: refreshToken,
-              expiresIn: result.getAccessToken().getExpiration() * 1000 - Date.now(),
-            });
-        });
-      });
-    });
-  }
-}
-
-class TokenManager {
-  constructor(accountIndex) {
-    this.accountIndex = accountIndex;
-    this.username = accounts[accountIndex].username;
-    this.accessToken = null;
-    this.refreshToken = null;
-    this.idToken = null;
-    this.expiresAt = null;
-    this.auth = new CognitoAuth(accounts[accountIndex].username, accounts[accountIndex].password);
-    this.tokenFilePath = path.join(config.stork.tokenPath, `${this.username.replace(/@/g, "_at_")}.json`);
-    this.retryCount = 0;
-  }
-
-  async getValidToken() {
-    try {
-      await this.loadTokensFromFile();
-
-      if (!this.accessToken || this.isTokenExpired()) {
-        await this.refreshOrAuthenticate();
-      }
-
-      return this.accessToken;
-    } catch (error) {
-      log(`Error getting valid token for ${this.username}: ${error.message}`, "ERROR");
-      throw error;
-    }
-  }
-
-  async loadTokensFromFile() {
-    try {
-      if (fs.existsSync(this.tokenFilePath)) {
-        const tokensData = fs.readFileSync(this.tokenFilePath, "utf8");
-        const tokens = JSON.parse(tokensData);
-
-        if (tokens.accessToken && tokens.refreshToken && tokens.expiresAt) {
-          this.accessToken = tokens.accessToken;
-          this.refreshToken = tokens.refreshToken;
-          this.idToken = tokens.idToken;
-          this.expiresAt = tokens.expiresAt;
-          log(`Loaded tokens from file for ${this.username}`);
-        }
-      }
-    } catch (error) {
-      log(`Error loading tokens from file for ${this.username}: ${error.message}`, "WARN");
-    }
-  }
-
-  isTokenExpired() {
-    return !this.expiresAt || Date.now() >= this.expiresAt;
-  }
-
-  async refreshOrAuthenticate() {
-    try {
-      let result;
-      if (this.refreshToken) {
-        try {
-          result = await retryWithExponentialBackoff(() => this.auth.refreshSession(this.refreshToken), config.stork.maxRetries);
-        } catch (error) {
-          log(`Token refresh failed for ${this.username}, will try full authentication: ${error.message}`, "WARN");
-
-          result = await retryWithExponentialBackoff(() => this.auth.authenticate(), config.stork.maxRetries);
-        }
+      const proxyAgent = new HttpsProxyAgent(this.proxy);
+      const response = await axios.get("https://api.ipify.org?format=json", { httpsAgent: proxyAgent });
+      if (response.status === 200) {
+        this.proxyIP = response.data.ip;
+        return response.data.ip;
       } else {
-        result = await retryWithExponentialBackoff(() => this.auth.authenticate(), config.stork.maxRetries);
+        throw new Error(`Cannot check proxy IP. Status code: ${response.status}`);
       }
-      await this.updateTokens(result);
     } catch (error) {
-      log(`Token refresh/auth error for ${this.username}: ${error.message}`, "ERROR");
-      throw error;
+      throw new Error(`Error checking proxy IP: ${error.message}`);
     }
   }
 
-  async updateTokens(result) {
-    this.accessToken = result.accessToken;
-    this.idToken = result.idToken;
-    this.refreshToken = result.refreshToken;
-    this.expiresAt = Date.now() + result.expiresIn;
+  async makeRequest(
+    url,
+    method,
+    data = {},
+    options = {
+      retries: 2,
+      isAuth: false,
+      extraHeaders: {},
+      refreshToken: null,
+    }
+  ) {
+    const { retries, isAuth, extraHeaders, refreshToken } = options;
 
-    const tokens = {
-      accessToken: this.accessToken,
-      idToken: this.idToken,
-      refreshToken: this.refreshToken,
-      expiresAt: this.expiresAt,
-      isAuthenticated: true,
-      isVerifying: false,
+    const headers = {
+      ...this.headers,
+      ...extraHeaders,
     };
 
-    await this.saveTokensToFile(tokens);
-    log(`Tokens updated for ${this.username}`);
-  }
-
-  async saveTokensToFile(tokens) {
-    try {
-      fs.writeFileSync(this.tokenFilePath, JSON.stringify(tokens, null, 2), "utf8");
-      log(`Tokens saved to file for ${this.username}`);
-      return true;
-    } catch (error) {
-      log(`Error saving tokens for ${this.username}: ${error.message}`, "WARN");
-      return false;
+    if (!isAuth) {
+      headers["authorization"] = `Bearer ${this.token}`;
     }
-  }
-}
 
-class AccountProxyManager {
-  constructor() {
-    this.accountProxyMap = new Map();
-    this.proxies = [];
-    this.initialized = false;
-  }
-
-  loadProxies() {
-    try {
-      if (!fs.existsSync(config.threads.proxyFile)) {
-        log(`Proxy file not found at ${config.threads.proxyFile}, creating empty file`, "WARN");
-        fs.writeFileSync(config.threads.proxyFile, "", "utf8");
-        return [];
-      }
-
-      const proxyData = fs.readFileSync(config.threads.proxyFile, "utf8");
-      const proxies = proxyData
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line && !line.startsWith("#"));
-
-      if (proxies.length === 0) {
-        log("No valid proxies found in proxy file", "WARN");
-        return [];
-      }
-
-      log(`Loaded ${proxies.length} proxies from ${config.threads.proxyFile}`);
-      return proxies;
-    } catch (error) {
-      log(`Error loading proxies: ${error.message}`, "ERROR");
-      return [];
+    if (refreshToken) {
+      headers["authorization"] = `Bearer ${refreshToken}`;
     }
-  }
 
-  async initialize() {
-    if (this.initialized) return;
+    let proxyAgent = null;
+    if (settings.USE_PROXY) {
+      proxyAgent = new HttpsProxyAgent(this.proxy);
+    }
+    let currRetries = 0,
+      errorMessage = null,
+      errorStatus = 0;
 
-    this.proxies = this.loadProxies();
+    do {
+      try {
+        const response = await axios({
+          method,
+          url,
+          headers,
+          timeout: 120000,
+          ...(proxyAgent ? { httpsAgent: proxyAgent, httpAgent: proxyAgent } : {}),
+          ...(method.toLowerCase() != "get" ? { data } : {}),
+        });
+        if (response?.data?.data) return { status: response.status, success: true, data: response.data.data, error: null };
+        return { success: true, data: response.data, status: response.status, error: null };
+      } catch (error) {
+        errorStatus = error.status;
+        errorMessage = error?.response?.data?.message ? error?.response?.data : error.message;
+        this.log(`Request failed: ${url} | Status: ${error.status} | ${JSON.stringify(errorMessage || {})}...`, "warning");
 
-    await this.assignProxiesToAccounts();
-
-    this.saveProxyMappings();
-
-    this.initialized = true;
-    log(`Proxy manager initialized with ${this.accountProxyMap.size} account-proxy mappings`);
-  }
-
-  async assignProxiesToAccounts() {
-    await this.loadProxyMappings();
-
-    if (this.proxies.length === 0) {
-      for (const account of accounts) {
-        if (!this.accountProxyMap.has(account.username)) {
-          this.accountProxyMap.set(account.username, null);
-          log(`Account ${account.username} will use direct connection (no proxy)`);
+        if (error.status == 401) {
+          this.log(`Unauthorized: ${url} | trying get new token...`);
+          this.token = await this.getValidToken(true);
+          return await this.makeRequest(url, method, data, options);
         }
-      }
-      return;
-    }
-
-    const proxyUsage = new Map();
-    for (const proxy of this.proxies) {
-      proxyUsage.set(proxy, 0);
-    }
-
-    for (const [_, proxy] of this.accountProxyMap.entries()) {
-      if (proxy && proxyUsage.has(proxy)) {
-        proxyUsage.set(proxy, proxyUsage.get(proxy) + 1);
-      }
-    }
-
-    for (const account of accounts) {
-      if (!this.accountProxyMap.has(account.username)) {
-        let leastUsedProxy = null;
-        let minUsage = Infinity;
-
-        for (const [proxy, count] of proxyUsage.entries()) {
-          if (count < minUsage) {
-            minUsage = count;
-            leastUsedProxy = proxy;
-          }
+        if (error.status == 400) {
+          this.log(`Invalid request for ${url}, maybe have new update from server | contact: https://t.me/airdrophuntersieutoc to get new update!`, "error");
+          return { success: false, status: error.status, error: errorMessage, data: null };
         }
+        if (error.status == 429) {
+          this.log(`Rate limit ${JSON.stringify(errorMessage)}, waiting 60s to retries`, "warning");
+          await sleep(60);
+        }
+        if (currRetries > retries) {
+          return { status: error.status, success: false, error: errorMessage, data: null };
+        }
+        currRetries++;
+        await sleep(5);
+      }
+    } while (currRetries <= retries);
+    return { status: errorStatus, success: false, error: errorMessage, data: null };
+  }
 
-        if (leastUsedProxy) {
-          this.accountProxyMap.set(account.username, leastUsedProxy);
-          proxyUsage.set(leastUsedProxy, proxyUsage.get(leastUsedProxy) + 1);
-          log(`Assigned proxy ${leastUsedProxy} to account ${account.username}`);
+  async login() {
+    const payload = {
+      email: this.itemData.email,
+      password: this.itemData.password,
+    };
+    return this.makeRequest(`https://app-auth.jp.stork-oracle.network/token?grant_type=password`, "post", payload, { isAuth: true });
+  }
+
+  async getRefereshToken() {
+    return this.makeRequest(
+      `${this.baseURL}/auth/refresh`,
+      "post",
+      {
+        refreshToken: this.authInfo.refreshToken,
+      },
+      {
+        refreshToken: this.authInfo.refreshToken,
+      }
+    );
+  }
+
+  async getUserData() {
+    return this.makeRequest(`${this.baseURL}/v1/me`, "get");
+  }
+
+  async getHash() {
+    return this.makeRequest(`${this.baseURL}/v1/stork_signed_prices`, "get");
+  }
+
+  async validateHash(payload) {
+    // { msg_hash: msg_hash, valid: true }
+    return this.makeRequest(`${this.baseURL}/v1/stork_signed_prices/validations`, "post", payload);
+  }
+
+  async getValidToken(isNew = false) {
+    const existingToken = this.token;
+    const { isExpired: isExp, expirationDate } = isTokenExpired(existingToken);
+
+    this.log(`Access token status: ${isExp ? "Expired".yellow : "Valid".green} | Acess token exp: ${expirationDate}`);
+    if (existingToken && !isNew && !isExp) {
+      this.log("Using valid token", "success");
+      return existingToken;
+    }
+
+    // if (this.authInfo?.refreshToken) {
+    //   const { isExpired: isExpRe, expirationDate: expirationDateRe } = isTokenExpired(this.authInfo.refreshToken);
+    //   this.log(`RefereshToken token status: ${isExpRe ? "Expired".yellow : "Valid".green} | RefereshToken token exp: ${expirationDateRe}`);
+    //   if (!isExpRe) {
+    //     const result = await this.getRefereshToken();
+    //     if (result.data?.access_token) {
+    //       await saveJson(this.session_name, JSON.stringify(result.data), "localStorage.json");
+    //       return result.data.access_token;
+    //     }
+    //   }
+    // }
+
+    this.log("No found token or experied, logining......", "warning");
+    const loginRes = await this.login();
+    if (!loginRes?.success) return null;
+    const newToken = loginRes.data;
+    if (newToken?.access_token) {
+      await saveJson(this.session_name, JSON.stringify(newToken), "localStorage.json");
+      return newToken.access_token;
+    }
+    this.log("Can't get new token...", "warning");
+    return null;
+  }
+
+  async handleSyncData() {
+    this.log(`Sync data...`);
+    let userData = { success: true, data: null, status: 0, error: null },
+      retries = 0;
+
+    do {
+      userData = await this.getUserData();
+      if (userData?.success) break;
+      retries++;
+    } while (retries < 1 && userData.status !== 400);
+    if (userData.success) {
+      const { referral_code, stats } = userData.data;
+      this.log(`Ref code: ${referral_code} | Invalid validate: ${stats?.stork_signed_prices_invalid_count || 0} | Total points: ${stats?.stork_signed_prices_valid_count || 0}`, "custom");
+    } else {
+      return this.log("Can't sync new data...skipping", "warning");
+    }
+    return userData;
+  }
+
+  async handleHB() {
+    const result = await this.getHash();
+    if (!result.success || !result.data) return this.log(`Can't get hash validate`, "warning");
+    const keys = result.data;
+    for (const key in keys) {
+      if (key.includes("USD")) {
+        const msg_hash = keys[key]?.timestamped_signature?.msg_hash;
+        this.log(`Starting validate message hash: ${msg_hash}`);
+        const res = await this.validateHash({
+          msg_hash: msg_hash,
+          valid: true,
+        });
+        if (res?.success && res?.data?.message == "ok") {
+          this.log(`[${new Date().toLocaleString()}] Validate ${msg_hash} success!`, "success");
         } else {
-          this.accountProxyMap.set(account.username, null);
-          log(`Account ${account.username} will use direct connection (no proxy)`);
+          this.log(`[${new Date().toLocaleString()}] Validate ${msg_hash} failed! | ${JSON.stringify(res || {})}`, "warning");
         }
       }
     }
+    this.log(`Waiting 5 minutes for next ping...`);
   }
 
-  getProxyForAccount(username) {
-    if (!this.initialized) {
-      log("Proxy manager not initialized, returning null", "WARN");
-      return null;
-    }
-
-    const proxy = this.accountProxyMap.get(username);
-    log(`Using ${proxy || "direct connection"} for account ${username}`);
-    return proxy;
-  }
-
-  saveProxyMappings() {
-    try {
-      const mappingFile = path.join(__dirname, "proxy-mappings.json");
-      const mappings = {};
-
-      for (const [username, proxy] of this.accountProxyMap.entries()) {
-        mappings[username] = proxy;
-      }
-
-      fs.writeFileSync(mappingFile, JSON.stringify(mappings, null, 2), "utf8");
-      log(`Saved ${Object.keys(mappings).length} account-proxy mappings to ${mappingFile}`);
-    } catch (error) {
-      log(`Error saving proxy mappings: ${error.message}`, "ERROR");
-    }
-  }
-
-  async loadProxyMappings() {
-    try {
-      const mappingFile = path.join(__dirname, "proxy-mappings.json");
-
-      if (fs.existsSync(mappingFile)) {
-        const data = fs.readFileSync(mappingFile, "utf8");
-        const mappings = JSON.parse(data);
-
-        const validProxies = new Set(this.proxies);
-
-        for (const [username, proxy] of Object.entries(mappings)) {
-          if (proxy === null || validProxies.has(proxy)) {
-            this.accountProxyMap.set(username, proxy);
-          }
-        }
-
-        log(`Loaded ${this.accountProxyMap.size} account-proxy mappings from ${mappingFile}`);
-      } else {
-        log(`No existing proxy mappings found, will create new mappings`);
-      }
-    } catch (error) {
-      log(`Error loading proxy mappings: ${error.message}`, "WARN");
-    }
-  }
-}
-
-const proxyManager = new AccountProxyManager();
-
-function getProxyAgent(proxy) {
-  if (!proxy) return null;
-  if (proxy.startsWith("http")) return new HttpsProxyAgent(proxy);
-  throw new Error(`Unsupported proxy protocol: ${proxy}`);
-}
-
-async function refreshTokens(refreshToken, username) {
-  return apiRateLimiter.schedule(async () => {
-    try {
-      log(`Refreshing access token via Stork API for ${username}...`);
-      const response = await axios({
-        method: "POST",
-        url: `${config.stork.authURL}/refresh`,
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": config.stork.userAgent,
-          Origin: config.stork.origin,
-        },
-        data: { refresh_token: refreshToken },
-        timeout: config.stork.requestTimeoutMs,
-      });
-
-      const tokens = {
-        accessToken: response.data.access_token,
-        idToken: response.data.id_token || "",
-        refreshToken: response.data.refresh_token || refreshToken,
-        expiresAt: Date.now() + 3600 * 1000,
-        isAuthenticated: true,
-        isVerifying: false,
-      };
-
-      log(`Token refreshed successfully via Stork API for ${username}`, "SUCCESS");
-      return tokens;
-    } catch (error) {
-      log(`Token refresh failed for ${username}: ${error.message}`, "ERROR");
-      throw error;
-    }
-  });
-}
-
-async function getSignedPrices(tokens, username) {
-  return apiRateLimiter.schedule(async () => {
-    try {
-      const response = await axios({
-        method: "GET",
-        url: `${config.stork.baseURL}/stork_signed_prices`,
-        headers: {
-          Authorization: `Bearer ${tokens.accessToken}`,
-          "Content-Type": "application/json",
-          Origin: config.stork.origin,
-          "User-Agent": config.stork.userAgent,
-        },
-        timeout: config.stork.requestTimeoutMs,
-      });
-
-      const dataObj = response.data.data;
-      const result = Object.keys(dataObj).map((assetKey) => {
-        const assetData = dataObj[assetKey];
-        return {
-          asset: assetKey,
-          msg_hash: assetData.timestamped_signature.msg_hash,
-          price: assetData.price,
-          timestamp: new Date(assetData.timestamped_signature.timestamp / 1000000).toISOString(),
-          ...assetData,
-        };
-      });
-
-      return result;
-    } catch (error) {
-      log(`Error getting signed prices for ${username}: ${error.message}`, "ERROR");
-      throw error;
-    }
-  });
-}
-
-async function sendValidation(tokens, msgHash, isValid, proxy, username) {
-  return apiRateLimiter.schedule(async () => {
-    try {
-      const agent = getProxyAgent(proxy);
-      const response = await axios({
-        method: "POST",
-        url: `${config.stork.baseURL}/stork_signed_prices/validations`,
-        headers: {
-          Authorization: `Bearer ${tokens.accessToken}`,
-          "Content-Type": "application/json",
-          Origin: config.stork.origin,
-          "User-Agent": config.stork.userAgent,
-        },
-        httpsAgent: agent,
-        data: { msg_hash: msgHash, valid: isValid },
-        timeout: config.stork.requestTimeoutMs,
-      });
-
-      log(`✓ Validation successful for ${username} - ${msgHash.substring(0, 10)}... via ${proxy || "direct"}`);
-      return response.data;
-    } catch (error) {
-      log(`✗ Validation failed for ${username} - ${msgHash.substring(0, 10)}...: ${error.message}`, "ERROR");
-      throw error;
-    }
-  });
-}
-
-async function getUserStats(tokens, username) {
-  return apiRateLimiter.schedule(async () => {
-    try {
-      const response = await axios({
-        method: "GET",
-        url: `${config.stork.baseURL}/me`,
-        headers: {
-          Authorization: `Bearer ${tokens.accessToken}`,
-          "Content-Type": "application/json",
-          Origin: config.stork.origin,
-          "User-Agent": config.stork.userAgent,
-        },
-        timeout: config.stork.requestTimeoutMs,
-      });
-
-      return response.data.data;
-    } catch (error) {
-      log(`Error getting user stats for ${username}: ${error.message}`, "ERROR");
-      throw error;
-    }
-  });
-}
-
-function validatePrice(priceData, username) {
-  try {
-    log(`Validating data for ${username} - ${priceData.asset || "unknown asset"}`);
-    if (!priceData.msg_hash || !priceData.price || !priceData.timestamp) {
-      log(`Incomplete data for ${username}, considered invalid`, "WARN");
-      return false;
-    }
-
-    const currentTime = Date.now();
-    const dataTime = new Date(priceData.timestamp).getTime();
-    const timeDiffMinutes = (currentTime - dataTime) / (1000 * 60);
-
-    if (timeDiffMinutes > 60) {
-      log(`Data too old for ${username} (${Math.round(timeDiffMinutes)} minutes ago)`, "WARN");
-      return false;
-    }
-
-    return true;
-  } catch (error) {
-    log(`Validation error for ${username}: ${error.message}`, "ERROR");
-    return false;
-  }
-}
-
-if (!isMainThread) {
-  const { priceData, tokens, proxy, username } = workerData;
-
-  async function validateAndSend() {
-    try {
-      const isValid = validatePrice(priceData, username);
-      await sendValidation(tokens, priceData.msg_hash, isValid, proxy, username);
-      parentPort.postMessage({ success: true, msgHash: priceData.msg_hash, isValid });
-    } catch (error) {
-      parentPort.postMessage({ success: false, error: error.message, msgHash: priceData.msg_hash });
-    }
-  }
-
-  validateAndSend();
-} else {
-  const accountStats = new Map();
-
-  async function runValidationProcess(tokenManager) {
-    const username = tokenManager.username;
-    try {
-      log(`--------- STARTING VALIDATION PROCESS FOR ${username} ---------`);
-
-      const tokens = {
-        accessToken: tokenManager.accessToken,
-        idToken: tokenManager.idToken,
-        refreshToken: tokenManager.refreshToken,
-      };
-
-      let initialUserData;
+  async runAccount() {
+    this.session_name = this.itemData.email;
+    this.authInfo = JSON.parse(this.localStorage[this.session_name] || "{}");
+    this.token = this.authInfo?.access_token;
+    this.#set_headers();
+    if (settings.USE_PROXY) {
       try {
-        initialUserData = await retryWithExponentialBackoff(() => getUserStats(tokens, username), config.stork.maxRetries);
+        this.proxyIP = await this.checkProxyIP();
       } catch (error) {
-        log(`Could not fetch initial user stats for ${username}: ${error.message}`, "ERROR");
-
-        await tokenManager.refreshOrAuthenticate();
-        initialUserData = await retryWithExponentialBackoff(() => getUserStats(tokens, username), config.stork.maxRetries);
-      }
-
-      if (!initialUserData || !initialUserData.stats) {
-        throw new Error(`Could not fetch initial user stats for ${username}`);
-      }
-
-      const initialValidCount = initialUserData.stats.stork_signed_prices_valid_count || 0;
-      const initialInvalidCount = initialUserData.stats.stork_signed_prices_invalid_count || 0;
-
-      if (!accountStats.has(username)) {
-        accountStats.set(username, {
-          validCount: initialValidCount,
-          invalidCount: initialInvalidCount,
-          lastRunTime: Date.now(),
-        });
-      }
-
-      const signedPrices = await retryWithExponentialBackoff(() => getSignedPrices(tokens, username), config.stork.maxRetries);
-
-      const accountProxy = proxyManager.getProxyForAccount(username);
-
-      if (!signedPrices || signedPrices.length === 0) {
-        log(`No data to validate for ${username}`);
-        try {
-          const userData = await getUserStats(tokens, username);
-          displayStats(userData, username);
-        } catch (error) {
-          log(`Could not fetch user stats for ${username}: ${error.message}`, "ERROR");
-        }
+        this.log(`Cannot check proxy IP: ${error.message}`, "warning");
         return;
       }
+      const timesleep = getRandomNumber(settings.DELAY_START_BOT[0], settings.DELAY_START_BOT[1]);
+      this.log(`Bắt đầu sau ${timesleep} giây...`);
+      await sleep(timesleep);
+    }
 
-      const workerPromises = [];
-
-      const chunkSize = Math.ceil(signedPrices.length / config.threads.maxWorkers);
-      const batches = [];
-      for (let i = 0; i < signedPrices.length; i += chunkSize) {
-        batches.push(signedPrices.slice(i, i + chunkSize));
+    const token = await this.getValidToken();
+    if (!token) return;
+    this.token = token;
+    const userData = await this.handleSyncData();
+    await sleep(1);
+    if (userData?.success) {
+      const interValCheckPoint = setInterval(() => this.handleSyncData(), 30 * 60 * 1000);
+      intervalIds.push(interValCheckPoint);
+      if (settings.AUTO_MINING) {
+        await this.handleHB();
+        const interValHB = setInterval(() => this.handleHB(), settings.PING_INTERVAL * 1000);
+        intervalIds.push(interValHB);
       }
-
-      for (let i = 0; i < Math.min(batches.length, config.threads.maxWorkers); i++) {
-        const batch = batches[i];
-
-        const proxy = accountProxy;
-
-        await randomDelay(100, 1000);
-
-        batch.forEach((priceData) => {
-          workerPromises.push(
-            new Promise((resolve) => {
-              const worker = new Worker(__filename, {
-                workerData: { priceData, tokens, proxy, username },
-              });
-              worker.on("message", resolve);
-              worker.on("error", (error) => resolve({ success: false, error: error.message }));
-              worker.on("exit", () => resolve({ success: false, error: "Worker exited" }));
-            })
-          );
-        });
-      }
-
-      const results = await Promise.all(workerPromises);
-      const successCount = results.filter((r) => r.success).length;
-      log(`Processed ${successCount}/${results.length} validations successfully for ${username}`, "SUCCESS");
-
-      const updatedUserData = await retryWithExponentialBackoff(() => getUserStats(tokens, username), config.stork.maxRetries);
-
-      const newValidCount = updatedUserData.stats.stork_signed_prices_valid_count || 0;
-      const newInvalidCount = updatedUserData.stats.stork_signed_prices_invalid_count || 0;
-
-      const stats = accountStats.get(username);
-      const actualValidIncrease = newValidCount - stats.validCount;
-      const actualInvalidIncrease = newInvalidCount - stats.invalidCount;
-
-      accountStats.set(username, {
-        validCount: newValidCount,
-        invalidCount: newInvalidCount,
-        lastRunTime: Date.now(),
-      });
-
-      displayStats(updatedUserData, username);
-      log(`--------- VALIDATION SUMMARY FOR ${username} ---------`);
-      log(`Total validations: ${newValidCount}`, "CUSTOM");
-      log(`Successfully added: ${actualValidIncrease}`, "SUCCESS");
-      log(`Failed validations: ${actualInvalidIncrease}`, "WARNING");
-      log(`--------- COMPLETE FOR ${username} ---------`);
-
-      return { success: true, username };
-    } catch (error) {
-      log(`Validation process stopped for ${username}: ${error.message}`, "ERROR");
-      return { success: false, username, error: error.message };
+    } else {
+      this.log("Can't get user info...skipping", "error");
     }
   }
+}
 
-  function displayStats(userData, username) {
-    if (!userData || !userData.stats) {
-      log(`No valid stats data available to display for ${username}`, "WARN");
-      return;
+function stopInterVal() {
+  if (intervalIds.length > 0) {
+    for (const intervalId of intervalIds) {
+      clearInterval(intervalId);
     }
+    intervalIds = [];
+  }
+}
 
-    log(`---------------------------------------------`);
-    log(`User: ${userData.email || "N/A"} | ID: ${userData.id || "N/A"} | Referral Code: ${userData.referral_code || "N/A"}`);
-    log(`✓ Valid Validations: ${userData.stats.stork_signed_prices_valid_count || 0}`, "SUCCESS");
-    log(`✗ Invalid Validations: ${userData.stats.stork_signed_prices_invalid_count || 0}`, "WARN");
-    log(`↻ Last Validated At: ${userData.stats.stork_signed_prices_last_verified_at || "Never"}`, "CUSTOM");
-    log(`👥 Referral Usage Count: ${userData.stats.referral_usage_count || 0}`);
-    log(`Next validation in ${config.stork.intervalSeconds} seconds...`);
-    log(`---------------------------------------------`);
+async function main() {
+  console.clear();
+  console.log(colors.yellow("\nTool được phát triển bởi nhóm tele Airdrop Hunter Siêu Tốc (https://t.me/airdrophuntersieutoc)"));
+
+  const data = [];
+  // loadData("privateKeys.txt");
+  const accounts = loadData("accounts.txt");
+  const proxies = loadData("proxy.txt");
+
+  if (accounts.length == 0 || (accounts.length > proxies.length && settings.USE_PROXY)) {
+    console.log("Số lượng proxy và accounts phải bằng nhau.".red);
+    console.log(`Data: ${accounts.length}`);
+    console.log(`Proxy: ${proxies.length}`);
+    process.exit(1);
+  }
+  if (!settings.USE_PROXY) {
+    console.log(`You are running bot without proxies!!!`.yellow);
   }
 
-  class AccountBatchManager {
-    constructor() {
-      this.currentBatch = [];
-      this.activeAccounts = new Set();
-      this.finished = false;
-      this.batchIndex = 0;
-      this.tokenManagers = new Map();
-    }
+  let maxThreads = settings.USE_PROXY ? settings.MAX_THEADS : settings.MAX_THEADS_NO_PROXY;
 
-    setupTokenManagers() {
-      for (let i = 0; i < accounts.length; i++) {
-        const tokenManager = new TokenManager(i);
-        this.tokenManagers.set(accounts[i].username, tokenManager);
-      }
-      log(`Created ${this.tokenManagers.size} token managers for accounts`);
-    }
+  const { endpoint, message } = await checkBaseUrl();
+  if (!endpoint) return console.log(`Không thể tìm thấy ID API, thử lại sau!`.red);
+  console.log(`${message}`.yellow);
 
-    getNextBatch() {
-      if (this.finished) return null;
+  const itemDatas = accounts
+    .map((val, index) => {
+      const [email, password] = val.split("|");
+      const item = {
+        email: email,
+        password: password,
+        index,
+      };
+      return item;
+    })
+    .filter((i) => i !== null);
 
-      const startIndex = this.batchIndex * config.threads.accountBatchSize;
-      if (startIndex >= accounts.length) {
-        this.finished = true;
-        return null;
-      }
+  process.on("SIGINT", async () => {
+    console.log("Stopping...".yellow);
+    stopInterVal();
+    await sleep(1);
+    process.exit();
+  });
 
-      const endIndex = Math.min(startIndex + config.threads.accountBatchSize, accounts.length);
-      const batch = accounts.slice(startIndex, endIndex);
-      this.batchIndex++;
+  await sleep(1);
 
-      if (endIndex >= accounts.length) {
-        this.finished = true;
-      }
-
-      return batch;
-    }
-
-    async processBatch() {
-      const batch = this.getNextBatch();
-      if (!batch) return null;
-
-      log(`Processing batch ${this.batchIndex} with ${batch.length} accounts`);
-
-      const promises = batch.map(async (account) => {
-        const username = account.username;
-        this.activeAccounts.add(username);
-
-        await randomDelay(500, 3000);
-
-        try {
-          const tokenManager = this.tokenManagers.get(username);
-          if (!tokenManager) {
-            throw new Error(`No token manager found for ${username}`);
-          }
-
-          await tokenManager.getValidToken();
-
-          const result = await runValidationProcess(tokenManager);
-
-          setTimeout(() => {
-            this.scheduleNextRun(username);
-          }, config.stork.intervalSeconds * 1000);
-
-          return result;
-        } catch (error) {
-          log(`Error processing account ${username}: ${error.message}`, "ERROR");
-
-          setTimeout(() => {
-            this.scheduleNextRun(username);
-          }, config.stork.intervalSeconds * 2000);
-
-          return { success: false, username, error: error.message };
-        } finally {
-          this.activeAccounts.delete(username);
-        }
-      });
-
-      return Promise.all(promises);
-    }
-
-    scheduleNextRun(username) {
-      if (this.activeAccounts.size < config.threads.maxConcurrentAccounts) {
-        this.runForAccount(username);
-      } else {
-        setTimeout(() => {
-          this.scheduleNextRun(username);
-        }, 5000);
-      }
-    }
-
-    async runForAccount(username) {
-      this.activeAccounts.add(username);
-
-      try {
-        const tokenManager = this.tokenManagers.get(username);
-        if (!tokenManager) {
-          throw new Error(`No token manager found for ${username}`);
-        }
-
-        await tokenManager.getValidToken();
-        await runValidationProcess(tokenManager);
-
-        setTimeout(() => {
-          this.scheduleNextRun(username);
-        }, config.stork.intervalSeconds * 1000);
-      } catch (error) {
-        log(`Error in scheduled run for ${username}: ${error.message}`, "ERROR");
-
-        setTimeout(() => {
-          this.scheduleNextRun(username);
-        }, config.stork.intervalSeconds * 2000);
-      } finally {
-        this.activeAccounts.delete(username);
-      }
-    }
-
-    async start() {
-      this.setupTokenManagers();
-
-      await this.processBatch();
-
-      this.scheduleNextBatch();
-    }
-
-    scheduleNextBatch() {
-      if (this.finished) {
-        log("All batches processed, continuous operation mode activated");
-        return;
-      }
-
-      setTimeout(async () => {
-        await this.processBatch();
-        this.scheduleNextBatch();
-      }, config.threads.accountBatchDelayMs);
-    }
-  }
-
-  async function main() {
-    log("\nTool được phát triển bởi nhóm tele Airdrop Hunter Siêu Tốc (https://t.me/airdrophuntersieutoc)\n", "WARN");
-    if (!validateConfig()) {
-      process.exit(1);
-    }
-    fs.writeFileSync("proxy-mappings.json", "{}", "utf8");
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-
-    log(`Starting Stork Oracle Bot with ${accounts.length} accounts`);
-    log(`Max concurrent accounts: ${config.threads.maxConcurrentAccounts}`);
-    log(`Account batch size: ${config.threads.accountBatchSize}`);
-    log(`Account batch delay: ${config.threads.accountBatchDelayMs}ms`);
-
-    await proxyManager.initialize();
-
-    const batchManager = new AccountBatchManager();
-    await batchManager.start();
-
-    setInterval(() => {
-      log(`Active accounts: ${batchManager.activeAccounts.size}`);
-      log(`Total processed: ${accountStats.size}`);
-    }, 60 * 1000);
-
-    process.on("SIGINT", () => {
-      log("Received SIGINT, gracefully shutting down...", "WARN");
-      setTimeout(() => {
-        process.exit(0);
-      }, 2000);
+  for (let i = 0; i < itemDatas.length; i += maxThreads) {
+    const batch = itemDatas.slice(i, i + maxThreads);
+    const promises = batch.map(async (itemData, indexInBatch) => {
+      const accountIndex = i + indexInBatch;
+      const proxy = proxies[accountIndex] || null;
+      const client = new ClientAPI(itemData, accountIndex, proxy, endpoint);
+      return client.runAccount();
     });
+    await Promise.all(promises);
   }
-  main();
 }
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
